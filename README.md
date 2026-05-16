@@ -5,7 +5,7 @@ Paquete para firmar XML de documentos electrónicos (Factura, Guía de remisión
 ## Instalación
 
 ```bash
-composer require dazza-dev/sri-signer
+composer require clonixdev/sri-signer
 ```
 
 ## Guía de uso

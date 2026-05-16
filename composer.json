@@ -1,5 +1,6 @@
 {
-  "name": "dazza-dev/sri-signer",
+  "name": "clonixdev/sri-signer",
+  "version": "1.0.1",
   "description": "Paquete para firmar XML de documentos electrónicos (Factura, Guía de remisión, Nota crédito, Nota débito y Comprobante de retención) basado en las especificaciones del Servicio de Rentas Internas (SRI) de Ecuador.",
   "keywords": [
     "sri",

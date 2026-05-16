@@ -127,6 +127,8 @@ class Signer
         }
 
         $this->domDocument = new DOMDocument($this->version, $this->encoding);
+        $this->domDocument->preserveWhiteSpace = false;
+        $this->domDocument->formatOutput = false;
         $this->domDocument->loadXML($this->xmlString);
 
         return $this;
@@ -433,7 +435,13 @@ class Signer
      */
     private function getHashComprobante(): string
     {
-        $canonicalized = $this->domDocument->C14N();
+        $root = $this->domDocument->documentElement;
+        if ($root === null) {
+            throw new SignerException('El documento XML no tiene elemento raíz.');
+        }
+
+        // Misma referencia que SignedInfo (URI="#comprobante"): digest del elemento raíz.
+        $canonicalized = $root->C14N(false, false, null);
 
         return $this->sha1Base64($canonicalized);
     }

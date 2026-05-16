@@ -122,11 +122,16 @@ class Certificate
     }
 
     /**
-     * Returns serial number from certificate object
+     * Returns serial number for XAdES IssuerSerial (decimal string, coherente con el certificado).
      */
     public function getSerialNumber(): string
     {
-        return $this->certificateObject['serialNumber'] ?? '';
+        $o = $this->certificateObject;
+        if (isset($o['serialNumberDecimal']) && $o['serialNumberDecimal'] !== '') {
+            return (string) $o['serialNumberDecimal'];
+        }
+
+        return (string) ($o['serialNumber'] ?? '');
     }
 
     /**
@@ -167,7 +172,8 @@ class Certificate
         $passwordArg = $this->certificatePassword ? '-passin pass:'.escapeshellarg($this->certificatePassword) : '-passin pass:';
 
         // Get all certificates
-        $command = 'openssl pkcs12 -in '.escapeshellarg($pkcs12FilePath).' -nokeys -clcerts '.$passwordArg;
+        $legacyArg = \function_exists('testsri_openssl_pkcs12_legacy_arg') ? \testsri_openssl_pkcs12_legacy_arg() : '';
+        $command = $this->opensslCli().' pkcs12'.$legacyArg.' -in '.escapeshellarg($pkcs12FilePath).' -nokeys -clcerts '.$passwordArg;
         $certOutput = $this->executeOpenSslCommand($command);
 
         // Parse certificates using regex to properly extract PEM blocks
@@ -184,7 +190,7 @@ class Certificate
                 file_put_contents($tempFile, $cert);
 
                 try {
-                    $subjectCommand = 'openssl x509 -in '.escapeshellarg($tempFile).' -noout -subject';
+                    $subjectCommand = $this->opensslCli().' x509 -in '.escapeshellarg($tempFile).' -noout -subject';
                     $subject = $this->executeOpenSslCommand($subjectCommand);
 
                     $certificates[] = [
@@ -212,7 +218,8 @@ class Certificate
         $passwordArg = $this->certificatePassword ? '-passin pass:'.escapeshellarg($this->certificatePassword) : '-passin pass:';
 
         // Get all private keys
-        $command = 'openssl pkcs12 -in '.escapeshellarg($pkcs12FilePath).' -nocerts -nodes '.$passwordArg;
+        $legacyArg = \function_exists('testsri_openssl_pkcs12_legacy_arg') ? \testsri_openssl_pkcs12_legacy_arg() : '';
+        $command = $this->opensslCli().' pkcs12'.$legacyArg.' -in '.escapeshellarg($pkcs12FilePath).' -nocerts -nodes '.$passwordArg;
         $keyOutput = $this->executeOpenSslCommand($command);
 
         // Parse private keys using regex to properly extract PEM blocks
@@ -306,6 +313,56 @@ class Certificate
     }
 
     /**
+     * Emisor en forma RFC 2253 / LDAP que acepta {@see javax.security.auth.x500.X500Principal} (MITyCLibXADES del SRI).
+     * Java no reconoce la palabra clave "organizationIdentifier"; hay que usar 2.5.4.97=#HEX (DirectoryString UTF8 en DER).
+     */
+    protected function formatIssuerForJavaX500Principal(array $issuer): string
+    {
+        $issuerAttrs = [];
+        foreach ($issuer as $shortName => $value) {
+            $normalizedShortName = $this->normalizeIssuerAttributeShortName((string) $shortName);
+            $isOrgId = $normalizedShortName === 'organizationIdentifier'
+                || $shortName === '2.5.4.97'
+                || $normalizedShortName === '2.5.4.97';
+            $issuerAttrs[] = [
+                'orgId' => $isOrgId,
+                'shortName' => $normalizedShortName,
+                'value' => is_array($value) ? implode('+', $value) : (string) $value,
+            ];
+        }
+
+        $parts = [];
+        foreach (array_reverse($issuerAttrs) as $attr) {
+            if ($attr['orgId']) {
+                $parts[] = '2.5.4.97='.$this->rfc2253HexDirectoryStringUtf8($attr['value']);
+            } else {
+                $parts[] = $attr['shortName'].'='.$attr['value'];
+            }
+        }
+
+        return implode(',', $parts);
+    }
+
+    /**
+     * Codifica UTF8String (DirectoryString) en TLV DER y devuelve el literal RFC 4514 "#" + hex (mayúsculas).
+     */
+    private function rfc2253HexDirectoryStringUtf8(string $utf8): string
+    {
+        $len = strlen($utf8);
+        if ($len <= 127) {
+            $der = "\x0C".chr($len).$utf8;
+        } elseif ($len <= 255) {
+            $der = "\x0C\x81".chr($len).$utf8;
+        } elseif ($len <= 65535) {
+            $der = "\x0C\x82".pack('n', $len).$utf8;
+        } else {
+            throw new CertificateException('organizationIdentifier demasiado largo para codificar en X509IssuerName.');
+        }
+
+        return '#'.strtoupper(bin2hex($der));
+    }
+
+    /**
      * Parse certificate PEM to extract structured information similar to JavaScript forge object
      */
     protected function extractCertificateObject(): array
@@ -334,11 +391,29 @@ class Certificate
             'notAfter' => date('M d H:i:s Y T', $certDetails['validTo_time_t']),
         ];
 
-        // Extract serial number (convert to decimal like JavaScript)
-        $serialNumber = $certDetails['serialNumber'];
-        $serialNumberHex = $certDetails['serialNumberHex'];
-        if (ctype_xdigit($serialNumber)) {
-            $serialNumberDecimal = (string) hexdec($serialNumber);
+        // Serial para XAdES (X509SerialNumber): debe ser el entero en decimal, como en el certificado X.509.
+        // openssl_x509_parse puede dar serialNumberHex y/o serialNumber; no usar hexdec() sobre dígitos decimales largos.
+        $serialNumber = $certDetails['serialNumber'] ?? '';
+        $serialNumberHex = $certDetails['serialNumberHex'] ?? '';
+        $serialNumberDecimal = '';
+
+        $hex = is_string($serialNumberHex) ? strtoupper(preg_replace('/[^0-9A-Fa-f]/', '', $serialNumberHex)) : '';
+        if ($hex !== '' && function_exists('gmp_init')) {
+            $hexNorm = ltrim($hex, '0');
+            $serialNumberDecimal = $hexNorm === '' ? '0' : gmp_strval(gmp_init($hexNorm, 16), 10);
+        } elseif ($hex !== '' && extension_loaded('bcmath')) {
+            $serialNumberDecimal = '0';
+            $len = strlen($hex);
+            for ($i = 0; $i < $len; $i++) {
+                $serialNumberDecimal = bcmul($serialNumberDecimal, '16', 0);
+                $serialNumberDecimal = bcadd($serialNumberDecimal, (string) hexdec($hex[$i]), 0);
+            }
+        } elseif ($serialNumber !== '' && preg_match('/^\d+$/', (string) $serialNumber)) {
+            $serialNumberDecimal = (string) $serialNumber;
+        } elseif ($hex !== '' && strlen($hex) <= 12) {
+            $serialNumberDecimal = (string) hexdec($hex);
+        } else {
+            $serialNumberDecimal = (string) $serialNumber;
         }
 
         // Extract public key info
@@ -351,7 +426,8 @@ class Certificate
         return [
             'hash' => $certDetails['hash'] ?? '',
             'subject' => $this->formatIssuer($subject),
-            'issuer' => $this->formatIssuer($issuer),
+            // MITyCLib/SRI: X500Principal no acepta "organizationIdentifier=" en el XML; usar 2.5.4.97=#...
+            'issuer' => $this->formatIssuerForJavaX500Principal($issuer),
             'validity' => $validity,
             'serialNumber' => $serialNumber,
             'serialNumberHex' => $serialNumberHex,
@@ -497,6 +573,21 @@ class Certificate
         $cleanData = preg_replace('/\s/', '', $data);
 
         return preg_match('/^[A-Za-z0-9+\/]*={0,2}$/', $cleanData) && (strlen($cleanData) % 4 === 0);
+    }
+
+    /**
+     * Ejecutable openssl: bin/openssl/openssl.exe del proyecto, SRI_OPENSSL_EXE, o "openssl" en PATH.
+     */
+    protected function opensslCli(): string
+    {
+        if (\function_exists('testsri_openssl_exe')) {
+            $path = \testsri_openssl_exe();
+            if ($path !== 'openssl') {
+                return escapeshellarg($path);
+            }
+        }
+
+        return 'openssl';
     }
 
     /**
